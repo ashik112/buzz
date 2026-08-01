@@ -73,6 +73,26 @@ Restart every service that runs `buzz-acp` so it loads the new binary. A restart
 briefly interrupts agents and clears their in-memory ACP sessions; obtain
 operational approval first when agents may have work in flight.
 
+For a systemd fleet whose unit names follow the Buzz Codex and Claude
+conventions, first inspect the matched units and then restart that exact set:
+
+```bash
+systemctl list-units --all --type=service \
+  "buzz-agent-*-codex.service" buzz-agent-codex.service \
+  "buzz-agent-*-claude.service" buzz-agent-claude.service
+sudo systemctl restart \
+  "buzz-agent-*-codex.service" buzz-agent-codex.service \
+  "buzz-agent-*-claude.service" buzz-agent-claude.service
+systemctl is-active \
+  "buzz-agent-*-codex.service" buzz-agent-codex.service \
+  "buzz-agent-*-claude.service" buzz-agent-claude.service
+```
+
+The quoted wildcard is expanded by systemd against loaded units, not by the
+shell against files. Review the list before restarting so unrelated services
+are not included. A service may run more than one adapter subprocess; service
+count and adapter-process count are therefore not necessarily equal.
+
 Verify the startup log for each service. It should report values equivalent to:
 
 ```text
@@ -80,3 +100,17 @@ max_turn=1800s max_turns_per_session=25 max_tool_calls_per_turn=100
 ```
 
 Building the binary alone does not update an already-running process.
+
+### Deployment record: 2026-08-01
+
+The guarded `main` binary was deployed to 30 systemd services: 15 Codex and
+15 Claude harnesses. Each service runs two adapters, for 60 adapter subprocesses.
+After restart, every service was active, all 60 adapter children were present,
+and every startup summary reported:
+
+```text
+idle_timeout=900s max_turn=1800s max_turns_per_session=25 max_tool_calls_per_turn=100
+```
+
+No startup errors were present in the post-restart service logs. The restart
+cleared all sessions that predated the guardrail deployment.
