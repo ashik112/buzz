@@ -18,27 +18,26 @@ git remote -v
 
 ## Pull updates from upstream
 
-Keep the fork `main` branch as a clean reflection of upstream:
+The fork `main` branch is the production branch and contains the local
+guardrails. Merge upstream into it without rewriting published history:
 
 ```bash
 git fetch upstream
 git switch main
-git merge --ff-only upstream/main
+git merge upstream/main
+. ./bin/activate-hermit
+cargo test -p buzz-acp
 git push origin main
 ```
 
-Then replay the guardrail changes on top of the updated upstream branch:
+If the merge reports conflicts, resolve them and rerun the tests before pushing
+or deploying. Never force-push `main`. GitHub **Sync fork** is designed for a
+fork with no local divergence, so use the explicit merge workflow above for
+this customized fork.
 
-```bash
-git switch safety/context-guardrails
-git rebase upstream/main
-cargo test -p buzz-acp
-git push --force-with-lease origin safety/context-guardrails
-```
-
-If the fast-forward or rebase reports conflicts, stop and resolve them before
-deploying. Do not force-push `main`. The GitHub **Sync fork** button can update
-`main`, but the guardrail branch must still be rebased and tested separately.
+Develop additional changes on a short-lived branch, review and test them, and
+then merge them into `main`. The merged `safety/context-guardrails` branch may
+remain as a historical reference; running code should be built from `main`.
 
 ## ACP context and spend guardrails
 
