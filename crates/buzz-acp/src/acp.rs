@@ -92,6 +92,9 @@ pub enum AcpError {
     #[error("Hard turn timeout exceeded (silence {silence:?})")]
     HardTimeout { silence: std::time::Duration },
 
+    #[error("Tool-call limit exceeded ({tool_calls}/{limit})")]
+    ToolCallLimitExceeded { tool_calls: u32, limit: u32 },
+
     #[error("Agent did not stop within {0:?} after cancellation")]
     CancelDrainTimeout(std::time::Duration),
 
@@ -751,6 +754,25 @@ impl AcpClient {
         idle_timeout: std::time::Duration,
         max_duration: std::time::Duration,
     ) -> Result<StopReason, AcpError> {
+        self.session_prompt_blocks_with_limits(
+            session_id,
+            prompt_blocks,
+            idle_timeout,
+            max_duration,
+            0,
+        )
+        .await
+    }
+
+    /// Send a prompt with idle, wall-clock, and tool-call limits.
+    pub async fn session_prompt_blocks_with_limits(
+        &mut self,
+        session_id: &str,
+        prompt_blocks: &[&str],
+        idle_timeout: std::time::Duration,
+        max_duration: std::time::Duration,
+        max_tool_calls: u32,
+    ) -> Result<StopReason, AcpError> {
         let params = build_prompt_params(session_id, prompt_blocks);
         let hard_deadline = tokio::time::Instant::now() + max_duration;
         self.current_hard_deadline = Some(hard_deadline);
@@ -779,12 +801,13 @@ impl AcpClient {
         }
 
         let result = self
-            .read_until_response_with_idle_timeout(
+            .read_until_response_with_limits(
                 session_id,
                 id,
                 idle_timeout,
                 hard_deadline,
                 max_duration,
+                max_tool_calls,
             )
             .await;
 
@@ -795,9 +818,14 @@ impl AcpClient {
                 self.last_prompt_id = None;
                 self.current_hard_deadline = None;
             }
-            Err(AcpError::IdleTimeout(_) | AcpError::HardTimeout { .. }) => {
+            Err(
+                AcpError::IdleTimeout(_)
+                | AcpError::HardTimeout { .. }
+                | AcpError::ToolCallLimitExceeded { .. },
+            ) => {
                 // Leave last_prompt_id and current_hard_deadline set —
-                // caller will invoke cancel_with_cleanup.
+                // caller will invoke cancel_with_cleanup. The budget path
+                // replaces the poisoned process instead of reusing it.
             }
             Err(_) => {
                 self.last_prompt_id = None;
@@ -1013,12 +1041,13 @@ impl AcpClient {
             .checked_duration_since(tokio::time::Instant::now())
             .unwrap_or_default();
         let result = self
-            .read_until_response_with_idle_timeout(
+            .read_until_response_with_limits(
                 session_id,
                 prompt_id,
                 cleanup_idle,
                 hard_deadline,
                 remaining,
+                0,
             )
             .await?;
         self.parse_stop_reason(&result)
@@ -1275,6 +1304,7 @@ impl AcpClient {
     /// write time without needing access to outer state. See
     /// [`crate::pool::SteerRequest`] for why params are built here and not
     /// in the main loop.
+    #[cfg(test)]
     async fn read_until_response_with_idle_timeout(
         &mut self,
         session_id: &str,
@@ -1282,6 +1312,26 @@ impl AcpClient {
         idle_timeout: std::time::Duration,
         hard_deadline: tokio::time::Instant,
         max_duration: std::time::Duration,
+    ) -> Result<serde_json::Value, AcpError> {
+        self.read_until_response_with_limits(
+            session_id,
+            expected_id,
+            idle_timeout,
+            hard_deadline,
+            max_duration,
+            0,
+        )
+        .await
+    }
+
+    async fn read_until_response_with_limits(
+        &mut self,
+        session_id: &str,
+        expected_id: u64,
+        idle_timeout: std::time::Duration,
+        hard_deadline: tokio::time::Instant,
+        max_duration: std::time::Duration,
+        max_tool_calls: u32,
     ) -> Result<serde_json::Value, AcpError> {
         use tokio::time::Instant;
 
@@ -1308,6 +1358,7 @@ impl AcpClient {
         let mut idle_deadline = now + idle_timeout;
         let mut hard_deadline = hard_deadline;
         let mut last_activity_at = now;
+        let mut tool_calls = 0_u32;
 
         loop {
             // Determine which deadline fires first BEFORE sleeping — this is
@@ -1654,6 +1705,24 @@ impl AcpClient {
                     if let Some(method) = msg.get("method").and_then(|v| v.as_str()) {
                         match method {
                             "session/update" => {
+                                if msg
+                                    .pointer("/params/update/sessionUpdate")
+                                    .and_then(|v| v.as_str())
+                                    == Some("tool_call")
+                                {
+                                    tool_calls = tool_calls.saturating_add(1);
+                                    if max_tool_calls > 0 && tool_calls > max_tool_calls {
+                                        if let Some((_, _, ack_tx)) = pending_steer.take() {
+                                            let _ = ack_tx.send(
+                                                crate::pool::SteerAck::PromptCompletedNeutral,
+                                            );
+                                        }
+                                        return Err(AcpError::ToolCallLimitExceeded {
+                                            tool_calls,
+                                            limit: max_tool_calls,
+                                        });
+                                    }
+                                }
                                 if self.handle_session_update(&msg) {
                                     let activity_now = Instant::now();
                                     idle_deadline = activity_now + idle_timeout;
@@ -3212,6 +3281,33 @@ mod tests {
         );
         assert!(elapsed < std::time::Duration::from_secs(5));
         assert!(matches!(result, Err(AcpError::IdleTimeout(_))));
+    }
+
+    #[tokio::test]
+    async fn tool_call_limit_stops_continuously_active_turn() {
+        let mut client = spawn_script(
+            r#"for i in 1 2 3 4; do echo '{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"tool_call","title":"loop","kind":"shell"}}}'; done; sleep 10"#,
+        )
+        .await;
+        let max_dur = std::time::Duration::from_secs(10);
+        let hard_deadline = tokio::time::Instant::now() + max_dur;
+        let result = client
+            .read_until_response_with_limits(
+                "test",
+                999,
+                std::time::Duration::from_secs(5),
+                hard_deadline,
+                max_dur,
+                3,
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(AcpError::ToolCallLimitExceeded {
+                tool_calls: 4,
+                limit: 3
+            })
+        ));
     }
 
     #[tokio::test]

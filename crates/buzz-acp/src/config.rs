@@ -26,9 +26,16 @@ use crate::filter::SubscriptionRule;
 /// Override via `--idle-timeout` / `BUZZ_ACP_IDLE_TIMEOUT`.
 pub(crate) const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 900;
 
-/// Default absolute wall-clock cap per agent turn (2 hours).
+/// Default absolute wall-clock cap per agent turn (30 minutes).
 /// Override via `--max-turn-duration` / `BUZZ_ACP_MAX_TURN_DURATION`.
-pub(crate) const DEFAULT_MAX_TURN_DURATION_SECS: u64 = 7200;
+pub(crate) const DEFAULT_MAX_TURN_DURATION_SECS: u64 = 1800;
+
+/// Default successful turns retained in one ACP session before rotation.
+/// Bounded sessions prevent indefinitely growing transcript replay.
+pub(crate) const DEFAULT_MAX_TURNS_PER_SESSION: u32 = 25;
+
+/// Default tool-call circuit breaker for one prompt turn.
+pub(crate) const DEFAULT_MAX_TOOL_CALLS_PER_TURN: u32 = 100;
 
 /// Upper bound for `max_turn_duration` (7 days). Any higher is operationally
 /// meaningless and risks arithmetic overflow when deriving the in-flight
@@ -369,9 +376,14 @@ pub struct CliArgs {
 
     /// Maximum turns per session before proactive rotation. 0 = disabled
     /// (rotate only on MaxTokens / MaxTurnRequests).
-    #[arg(long, env = "BUZZ_ACP_MAX_TURNS_PER_SESSION", default_value_t = 0,
+    #[arg(long, env = "BUZZ_ACP_MAX_TURNS_PER_SESSION", default_value_t = DEFAULT_MAX_TURNS_PER_SESSION,
           value_parser = clap::value_parser!(u32))]
     pub max_turns_per_session: u32,
+
+    /// Maximum tool calls allowed during one prompt turn. 0 = disabled.
+    #[arg(long, env = "BUZZ_ACP_MAX_TOOL_CALLS_PER_TURN", default_value_t = DEFAULT_MAX_TOOL_CALLS_PER_TURN,
+          value_parser = clap::value_parser!(u32))]
+    pub max_tool_calls_per_turn: u32,
 
     /// Disable automatic presence (online/offline) status.
     #[arg(long, env = "BUZZ_ACP_NO_PRESENCE")]
@@ -519,6 +531,8 @@ pub struct Config {
     pub context_message_limit: u32,
     /// Maximum turns per session before proactive rotation. 0 = disabled.
     pub max_turns_per_session: u32,
+    /// Maximum tool calls during one prompt turn. 0 = disabled.
+    pub max_tool_calls_per_turn: u32,
     pub presence_enabled: bool,
     pub typing_enabled: bool,
     /// Whether NIP-AE agent core memory injection is enabled. When false,
@@ -1083,6 +1097,7 @@ impl Config {
             config_path: args.config,
             context_message_limit: args.context_message_limit,
             max_turns_per_session: args.max_turns_per_session,
+            max_tool_calls_per_turn: args.max_tool_calls_per_turn,
             presence_enabled: !args.no_presence,
             typing_enabled: !args.no_typing,
             memory_enabled: args.memory && !args.no_memory,
@@ -1123,7 +1138,7 @@ impl Config {
             format!(" allowed_respond_to=[{}]", modes.join(","))
         };
         format!(
-            "relay={} pubkey={} agent_cmd={} {} mcp_cmd={} idle_timeout={}s max_turn={}s agents={} heartbeat={}s subscribe={:?} dedup={:?} meh={:?} ignore_self={} context_limit={} max_turns_per_session={} presence={} typing={} memory={} model={} permission_mode={} {}{}",
+            "relay={} pubkey={} agent_cmd={} {} mcp_cmd={} idle_timeout={}s max_turn={}s agents={} heartbeat={}s subscribe={:?} dedup={:?} meh={:?} ignore_self={} context_limit={} max_turns_per_session={} max_tool_calls_per_turn={} presence={} typing={} memory={} model={} permission_mode={} {}{}",
             self.relay_url,
             self.keys.public_key().to_hex(),
             self.agent_command,
@@ -1139,6 +1154,7 @@ impl Config {
             self.ignore_self,
             self.context_message_limit,
             self.max_turns_per_session,
+            self.max_tool_calls_per_turn,
             self.presence_enabled,
             self.typing_enabled,
             self.memory_enabled,
@@ -1456,6 +1472,7 @@ mod tests {
             config_path: PathBuf::from("./buzz-acp.toml"),
             context_message_limit: 12,
             max_turns_per_session: 0,
+            max_tool_calls_per_turn: DEFAULT_MAX_TOOL_CALLS_PER_TURN,
             presence_enabled: true,
             typing_enabled: true,
             memory_enabled: true,

@@ -1551,6 +1551,7 @@ async fn tokio_main() -> Result<()> {
         channel_info: pool::ChannelInfoResolver::new(channel_info_map, relay.rest_client()),
         context_message_limit: config.context_message_limit,
         max_turns_per_session: config.max_turns_per_session,
+        max_tool_calls_per_turn: config.max_tool_calls_per_turn,
         permission_mode: config.permission_mode,
         agent_keys: config.keys.clone(),
         agent_owner_pubkey: startup_owner
@@ -3205,6 +3206,7 @@ fn handle_prompt_result(
         PromptOutcome::Error(_) => "error",
         PromptOutcome::Timeout(TimeoutKind::Idle) => "idle_timeout",
         PromptOutcome::Timeout(TimeoutKind::Hard { .. }) => "hard_timeout",
+        PromptOutcome::Timeout(TimeoutKind::Budget { .. }) => "activity_budget",
         PromptOutcome::AgentExited => "exited",
         PromptOutcome::Cancelled => "cancelled",
         PromptOutcome::CancelDrainTimeout(_) => "cancel_drain_timeout",
@@ -3278,6 +3280,10 @@ fn handle_prompt_result(
                         config.max_turn_duration_secs, suffix
                     )
                 }
+                "activity_budget" => format!(
+                    "Agent exceeded the per-turn tool-call limit ({}); the process is being replaced and the request follows the bounded retry policy.",
+                    config.max_tool_calls_per_turn
+                ),
                 _ => "Agent session timed out due to inactivity".to_string(),
             };
             emit_turn_error(&death_message, None);
@@ -5019,6 +5025,7 @@ mod build_mcp_servers_tests {
             config_path: std::path::PathBuf::from("./buzz-acp.toml"),
             context_message_limit: 12,
             max_turns_per_session: 0,
+            max_tool_calls_per_turn: 100,
             presence_enabled: true,
             typing_enabled: true,
             memory_enabled: false,
@@ -5240,6 +5247,7 @@ mod error_outcome_emission_tests {
             config_path: std::path::PathBuf::from("./buzz-acp.toml"),
             context_message_limit: 12,
             max_turns_per_session: 0,
+            max_tool_calls_per_turn: 100,
             presence_enabled: true,
             typing_enabled: true,
             memory_enabled: false,
