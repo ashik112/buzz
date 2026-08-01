@@ -95,6 +95,9 @@ pub enum AcpError {
     #[error("Tool-call limit exceeded ({tool_calls}/{limit})")]
     ToolCallLimitExceeded { tool_calls: u32, limit: u32 },
 
+    #[error("Context-compaction limit exceeded ({compactions}/{limit})")]
+    CompactionLimitExceeded { compactions: u32, limit: u32 },
+
     #[error("Agent did not stop within {0:?} after cancellation")]
     CancelDrainTimeout(std::time::Duration),
 
@@ -122,6 +125,44 @@ fn agent_error_from_json(error: &serde_json::Value) -> AcpError {
         None => error.to_string(),
     };
     AcpError::AgentError { code, message }
+}
+
+/// Return whether an ACP update marks the start of a context compaction.
+///
+/// Codex ACP exposes a structured `tool_call` with
+/// `_meta.contextCompaction=true`. Claude Agent ACP currently exposes its SDK
+/// `status: compacting` frame as the exact agent-message chunk below. Count
+/// only starts: completion updates must not consume a second fuse allowance.
+fn is_compaction_start_update(msg: &serde_json::Value) -> bool {
+    let Some(update) = msg.pointer("/params/update") else {
+        return false;
+    };
+
+    match update
+        .get("sessionUpdate")
+        .and_then(serde_json::Value::as_str)
+    {
+        Some("tool_call") => {
+            update
+                .pointer("/_meta/contextCompaction")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+                && update.get("status").and_then(serde_json::Value::as_str) == Some("in_progress")
+        }
+        Some("agent_message_chunk") => {
+            update
+                .pointer("/content/text")
+                .and_then(serde_json::Value::as_str)
+                == Some("Compacting...")
+        }
+        _ => false,
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct PromptCountLimits {
+    tool_calls: u32,
+    compactions: u32,
 }
 
 fn build_initialize_params() -> serde_json::Value {
@@ -725,6 +766,7 @@ impl AcpClient {
     ///
     /// The idle deadline resets on any stdout activity from the agent. The hard
     /// deadline is an absolute wall-clock cap (safety valve).
+    #[allow(dead_code)] // Backward-compatible helper for callers that do not set count fuses.
     pub async fn session_prompt_with_idle_timeout(
         &mut self,
         session_id: &str,
@@ -747,6 +789,7 @@ impl AcpClient {
     /// Used for slash-command pass-through: ACP connectors detect commands via
     /// the **first** block's text starting with `/`, so the harness sends
     /// `["/cmd args", "<buzz context>"]` instead of one wrapped block.
+    #[allow(dead_code)] // Backward-compatible helper for callers that do not set count fuses.
     pub async fn session_prompt_blocks_with_idle_timeout(
         &mut self,
         session_id: &str,
@@ -760,11 +803,12 @@ impl AcpClient {
             idle_timeout,
             max_duration,
             0,
+            0,
         )
         .await
     }
 
-    /// Send a prompt with idle, wall-clock, and tool-call limits.
+    /// Send a prompt with idle, wall-clock, tool-call, and compaction limits.
     pub async fn session_prompt_blocks_with_limits(
         &mut self,
         session_id: &str,
@@ -772,6 +816,7 @@ impl AcpClient {
         idle_timeout: std::time::Duration,
         max_duration: std::time::Duration,
         max_tool_calls: u32,
+        max_compactions: u32,
     ) -> Result<StopReason, AcpError> {
         let params = build_prompt_params(session_id, prompt_blocks);
         let hard_deadline = tokio::time::Instant::now() + max_duration;
@@ -807,7 +852,10 @@ impl AcpClient {
                 idle_timeout,
                 hard_deadline,
                 max_duration,
-                max_tool_calls,
+                PromptCountLimits {
+                    tool_calls: max_tool_calls,
+                    compactions: max_compactions,
+                },
             )
             .await;
 
@@ -821,7 +869,8 @@ impl AcpClient {
             Err(
                 AcpError::IdleTimeout(_)
                 | AcpError::HardTimeout { .. }
-                | AcpError::ToolCallLimitExceeded { .. },
+                | AcpError::ToolCallLimitExceeded { .. }
+                | AcpError::CompactionLimitExceeded { .. },
             ) => {
                 // Leave last_prompt_id and current_hard_deadline set —
                 // caller will invoke cancel_with_cleanup. The budget path
@@ -1047,7 +1096,7 @@ impl AcpClient {
                 cleanup_idle,
                 hard_deadline,
                 remaining,
-                0,
+                PromptCountLimits::default(),
             )
             .await?;
         self.parse_stop_reason(&result)
@@ -1319,7 +1368,7 @@ impl AcpClient {
             idle_timeout,
             hard_deadline,
             max_duration,
-            0,
+            PromptCountLimits::default(),
         )
         .await
     }
@@ -1331,7 +1380,7 @@ impl AcpClient {
         idle_timeout: std::time::Duration,
         hard_deadline: tokio::time::Instant,
         max_duration: std::time::Duration,
-        max_tool_calls: u32,
+        count_limits: PromptCountLimits,
     ) -> Result<serde_json::Value, AcpError> {
         use tokio::time::Instant;
 
@@ -1359,6 +1408,7 @@ impl AcpClient {
         let mut hard_deadline = hard_deadline;
         let mut last_activity_at = now;
         let mut tool_calls = 0_u32;
+        let mut compactions = 0_u32;
 
         loop {
             // Determine which deadline fires first BEFORE sleeping — this is
@@ -1705,13 +1755,37 @@ impl AcpClient {
                     if let Some(method) = msg.get("method").and_then(|v| v.as_str()) {
                         match method {
                             "session/update" => {
+                                if is_compaction_start_update(&msg) {
+                                    compactions = compactions.saturating_add(1);
+                                    tracing::warn!(
+                                        target: "acp::compaction",
+                                        "context compaction started ({}/{})",
+                                        compactions,
+                                        count_limits.compactions,
+                                    );
+                                    if count_limits.compactions > 0
+                                        && compactions > count_limits.compactions
+                                    {
+                                        if let Some((_, _, ack_tx)) = pending_steer.take() {
+                                            let _ = ack_tx.send(
+                                                crate::pool::SteerAck::PromptCompletedNeutral,
+                                            );
+                                        }
+                                        return Err(AcpError::CompactionLimitExceeded {
+                                            compactions,
+                                            limit: count_limits.compactions,
+                                        });
+                                    }
+                                }
                                 if msg
                                     .pointer("/params/update/sessionUpdate")
                                     .and_then(|v| v.as_str())
                                     == Some("tool_call")
                                 {
                                     tool_calls = tool_calls.saturating_add(1);
-                                    if max_tool_calls > 0 && tool_calls > max_tool_calls {
+                                    if count_limits.tool_calls > 0
+                                        && tool_calls > count_limits.tool_calls
+                                    {
                                         if let Some((_, _, ack_tx)) = pending_steer.take() {
                                             let _ = ack_tx.send(
                                                 crate::pool::SteerAck::PromptCompletedNeutral,
@@ -1719,7 +1793,7 @@ impl AcpClient {
                                         }
                                         return Err(AcpError::ToolCallLimitExceeded {
                                             tool_calls,
-                                            limit: max_tool_calls,
+                                            limit: count_limits.tool_calls,
                                         });
                                     }
                                 }
@@ -3298,7 +3372,10 @@ mod tests {
                 std::time::Duration::from_secs(5),
                 hard_deadline,
                 max_dur,
-                3,
+                PromptCountLimits {
+                    tool_calls: 3,
+                    compactions: 0,
+                },
             )
             .await;
         assert!(matches!(
@@ -3306,6 +3383,64 @@ mod tests {
             Err(AcpError::ToolCallLimitExceeded {
                 tool_calls: 4,
                 limit: 3
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn codex_compaction_limit_stops_second_compaction() {
+        let mut client = spawn_script(
+            r#"echo '{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"tool_call","toolCallId":"c1","title":"Context compacting","kind":"other","status":"in_progress","_meta":{"contextCompaction":true}}}}'; echo '{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"tool_call","toolCallId":"c2","title":"Context compacting","kind":"other","status":"in_progress","_meta":{"contextCompaction":true}}}}'; sleep 10"#,
+        )
+        .await;
+        let max_dur = std::time::Duration::from_secs(10);
+        let result = client
+            .read_until_response_with_limits(
+                "test",
+                999,
+                std::time::Duration::from_secs(5),
+                tokio::time::Instant::now() + max_dur,
+                max_dur,
+                PromptCountLimits {
+                    tool_calls: 0,
+                    compactions: 1,
+                },
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(AcpError::CompactionLimitExceeded {
+                compactions: 2,
+                limit: 1
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn claude_compaction_limit_stops_second_compaction() {
+        let mut client = spawn_script(
+            r#"echo '{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Compacting..."}}}}'; echo '{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Compacting..."}}}}'; sleep 10"#,
+        )
+        .await;
+        let max_dur = std::time::Duration::from_secs(10);
+        let result = client
+            .read_until_response_with_limits(
+                "test",
+                999,
+                std::time::Duration::from_secs(5),
+                tokio::time::Instant::now() + max_dur,
+                max_dur,
+                PromptCountLimits {
+                    tool_calls: 0,
+                    compactions: 1,
+                },
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(AcpError::CompactionLimitExceeded {
+                compactions: 2,
+                limit: 1
             })
         ));
     }

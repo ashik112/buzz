@@ -420,6 +420,8 @@ pub enum TimeoutKind {
     Hard { recently_active: bool },
     /// Turn exceeded the configured tool-call circuit breaker.
     Budget { tool_calls: u32, limit: u32 },
+    /// Turn attempted more context compactions than the configured fuse.
+    CompactionBudget { compactions: u32, limit: u32 },
 }
 
 /// Outcome of a prompt task.
@@ -534,6 +536,8 @@ pub struct PromptContext {
     pub max_turns_per_session: u32,
     /// Max tool calls during one prompt turn. 0 = disabled.
     pub max_tool_calls_per_turn: u32,
+    /// Max context compactions during one prompt turn. 0 = disabled.
+    pub max_compactions_per_turn: u32,
     /// Permission mode to apply after session creation. `Default` = skip.
     pub permission_mode: PermissionMode,
     /// Agent identity — used to derive the NIP-AE conversation key at
@@ -1695,11 +1699,13 @@ pub async fn run_prompt_task(
             );
             let init_result = agent
                 .acp
-                .session_prompt_with_idle_timeout(
+                .session_prompt_blocks_with_limits(
                     &session_id,
-                    &init_msg,
+                    &[init_msg.as_str()],
                     ctx.idle_timeout,
                     ctx.max_turn_duration,
+                    ctx.max_tool_calls_per_turn,
+                    ctx.max_compactions_per_turn,
                 )
                 .await;
 
@@ -1780,6 +1786,41 @@ pub async fn run_prompt_task(
                         agent,
                         source,
                         PromptOutcome::Timeout(TimeoutKind::Hard { recently_active }),
+                        requeue_batch_if_queue(&ctx, batch),
+                    );
+                    return;
+                }
+                Err(AcpError::CompactionLimitExceeded { compactions, limit }) => {
+                    tracing::error!(
+                        target: "pool::session",
+                        "context-compaction fuse tripped ({compactions}/{limit}) during initial_message for channel {cid} — replacing agent process and dropping the request without retry"
+                    );
+                    agent.state.invalidate_all();
+                    send_prompt_result(
+                        &result_tx,
+                        &turn_id,
+                        agent,
+                        source,
+                        PromptOutcome::Timeout(TimeoutKind::CompactionBudget {
+                            compactions,
+                            limit,
+                        }),
+                        requeue_batch_if_queue(&ctx, batch),
+                    );
+                    return;
+                }
+                Err(AcpError::ToolCallLimitExceeded { tool_calls, limit }) => {
+                    tracing::error!(
+                        target: "pool::session",
+                        "tool-call budget exceeded ({tool_calls}/{limit}) during initial_message for channel {cid} — replacing agent process and applying bounded retry policy"
+                    );
+                    agent.state.invalidate_all();
+                    send_prompt_result(
+                        &result_tx,
+                        &turn_id,
+                        agent,
+                        source,
+                        PromptOutcome::Timeout(TimeoutKind::Budget { tool_calls, limit }),
                         requeue_batch_if_queue(&ctx, batch),
                     );
                     return;
@@ -1932,6 +1973,7 @@ pub async fn run_prompt_task(
                     ctx.idle_timeout,
                     ctx.max_turn_duration,
                     ctx.max_tool_calls_per_turn,
+                    ctx.max_compactions_per_turn,
                 ) => result,
             }
         }
@@ -1944,6 +1986,7 @@ pub async fn run_prompt_task(
                     ctx.idle_timeout,
                     ctx.max_turn_duration,
                     ctx.max_tool_calls_per_turn,
+                    ctx.max_compactions_per_turn,
                 ) => result,
                 mode = rx => {
                     let control_signal = mode.unwrap_or(ControlSignal::Cancel);
@@ -2301,6 +2344,31 @@ pub async fn run_prompt_task(
                 agent,
                 source,
                 PromptOutcome::Timeout(TimeoutKind::Budget { tool_calls, limit }),
+                requeue_batch_if_queue(&ctx, batch),
+            );
+        }
+        Err(AcpError::CompactionLimitExceeded { compactions, limit }) => {
+            tracing::error!(
+                target: "pool::prompt",
+                "context-compaction fuse tripped ({compactions}/{limit}) — replacing agent process and dropping the request without retry"
+            );
+            agent.state.invalidate_all();
+            let usage = agent.acp.take_turn_usage();
+            publish_agent_turn_metric(
+                &ctx,
+                usage,
+                observer_channel_id,
+                &session_id,
+                &turn_id,
+                Some(buzz_core::agent_turn_metric::StopReason::Error),
+            )
+            .await;
+            send_prompt_result(
+                &result_tx,
+                &turn_id,
+                agent,
+                source,
+                PromptOutcome::Timeout(TimeoutKind::CompactionBudget { compactions, limit }),
                 requeue_batch_if_queue(&ctx, batch),
             );
         }
@@ -5431,6 +5499,9 @@ mod tests {
             PromptOutcome::Timeout(TimeoutKind::Idle) => "Timeout(Idle)",
             PromptOutcome::Timeout(TimeoutKind::Hard { .. }) => "Timeout(Hard)",
             PromptOutcome::Timeout(TimeoutKind::Budget { .. }) => "Timeout(Budget)",
+            PromptOutcome::Timeout(TimeoutKind::CompactionBudget { .. }) => {
+                "Timeout(CompactionBudget)"
+            }
             PromptOutcome::CancelDrainTimeout(_) => "CancelDrainTimeout",
             PromptOutcome::Error(_) => "Error",
             PromptOutcome::Cancelled => "Cancelled",
@@ -6440,6 +6511,7 @@ mod tests {
             context_message_limit: 0,
             max_turns_per_session: 0,
             max_tool_calls_per_turn: 100,
+            max_compactions_per_turn: 1,
             permission_mode: PermissionMode::Default,
             agent_keys: agent_keys.clone(),
             agent_owner_pubkey: owner_pubkey,

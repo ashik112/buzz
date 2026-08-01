@@ -37,6 +37,12 @@ pub(crate) const DEFAULT_MAX_TURNS_PER_SESSION: u32 = 25;
 /// Default tool-call circuit breaker for one prompt turn.
 pub(crate) const DEFAULT_MAX_TOOL_CALLS_PER_TURN: u32 = 100;
 
+/// Default context-compaction circuit breaker for one prompt turn.
+///
+/// One compaction is allowed so a legitimate long turn can finish. A second
+/// compaction indicates an effectively unbounded turn and terminates it.
+pub(crate) const DEFAULT_MAX_COMPACTIONS_PER_TURN: u32 = 1;
+
 /// Upper bound for `max_turn_duration` (7 days). Any higher is operationally
 /// meaningless and risks arithmetic overflow when deriving the in-flight
 /// deadline (`max_turn_duration + IN_FLIGHT_DEADLINE_BUFFER_SECS`).
@@ -385,6 +391,11 @@ pub struct CliArgs {
           value_parser = clap::value_parser!(u32))]
     pub max_tool_calls_per_turn: u32,
 
+    /// Maximum context compactions allowed during one prompt turn. 0 = disabled.
+    #[arg(long, env = "BUZZ_ACP_MAX_COMPACTIONS_PER_TURN", default_value_t = DEFAULT_MAX_COMPACTIONS_PER_TURN,
+          value_parser = clap::value_parser!(u32))]
+    pub max_compactions_per_turn: u32,
+
     /// Disable automatic presence (online/offline) status.
     #[arg(long, env = "BUZZ_ACP_NO_PRESENCE")]
     pub no_presence: bool,
@@ -533,6 +544,8 @@ pub struct Config {
     pub max_turns_per_session: u32,
     /// Maximum tool calls during one prompt turn. 0 = disabled.
     pub max_tool_calls_per_turn: u32,
+    /// Maximum context compactions during one prompt turn. 0 = disabled.
+    pub max_compactions_per_turn: u32,
     pub presence_enabled: bool,
     pub typing_enabled: bool,
     /// Whether NIP-AE agent core memory injection is enabled. When false,
@@ -1098,6 +1111,7 @@ impl Config {
             context_message_limit: args.context_message_limit,
             max_turns_per_session: args.max_turns_per_session,
             max_tool_calls_per_turn: args.max_tool_calls_per_turn,
+            max_compactions_per_turn: args.max_compactions_per_turn,
             presence_enabled: !args.no_presence,
             typing_enabled: !args.no_typing,
             memory_enabled: args.memory && !args.no_memory,
@@ -1138,7 +1152,7 @@ impl Config {
             format!(" allowed_respond_to=[{}]", modes.join(","))
         };
         format!(
-            "relay={} pubkey={} agent_cmd={} {} mcp_cmd={} idle_timeout={}s max_turn={}s agents={} heartbeat={}s subscribe={:?} dedup={:?} meh={:?} ignore_self={} context_limit={} max_turns_per_session={} max_tool_calls_per_turn={} presence={} typing={} memory={} model={} permission_mode={} {}{}",
+            "relay={} pubkey={} agent_cmd={} {} mcp_cmd={} idle_timeout={}s max_turn={}s agents={} heartbeat={}s subscribe={:?} dedup={:?} meh={:?} ignore_self={} context_limit={} max_turns_per_session={} max_tool_calls_per_turn={} max_compactions_per_turn={} presence={} typing={} memory={} model={} permission_mode={} {}{}",
             self.relay_url,
             self.keys.public_key().to_hex(),
             self.agent_command,
@@ -1155,6 +1169,7 @@ impl Config {
             self.context_message_limit,
             self.max_turns_per_session,
             self.max_tool_calls_per_turn,
+            self.max_compactions_per_turn,
             self.presence_enabled,
             self.typing_enabled,
             self.memory_enabled,
@@ -1473,6 +1488,7 @@ mod tests {
             context_message_limit: 12,
             max_turns_per_session: 0,
             max_tool_calls_per_turn: DEFAULT_MAX_TOOL_CALLS_PER_TURN,
+            max_compactions_per_turn: DEFAULT_MAX_COMPACTIONS_PER_TURN,
             presence_enabled: true,
             typing_enabled: true,
             memory_enabled: true,

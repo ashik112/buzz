@@ -41,20 +41,28 @@ remain as a historical reference; running code should be built from `main`.
 
 ## ACP context and spend guardrails
 
-The guarded branch changes these `buzz-acp` defaults:
+The guarded fork's `main` branch uses these `buzz-acp` defaults:
 
 | Guardrail | Environment variable | Default | Purpose |
 |---|---|---:|---|
 | Absolute turn duration | `BUZZ_ACP_MAX_TURN_DURATION` | 1,800 seconds | Stops a turn after 30 minutes even if output keeps it active. |
 | Session rotation | `BUZZ_ACP_MAX_TURNS_PER_SESSION` | 25 turns | Prevents indefinite transcript replay by rotating channel sessions. |
 | Tool-call circuit breaker | `BUZZ_ACP_MAX_TOOL_CALLS_PER_TURN` | 100 calls | Stops continuously active tool loops. |
+| Compaction fuse | `BUZZ_ACP_MAX_COMPACTIONS_PER_TURN` | 1 compaction | Stops the turn on its second compaction so compact-and-continue loops cannot run indefinitely. |
 
 The tool-call limit counts ACP `tool_call` updates, not ordinary text or status
 chunks. Exceeding it invalidates the adapter sessions and replaces that adapter
 process. The interrupted batch uses the existing bounded retry queue and
 exponential backoff.
 
-Setting either count limit to `0` disables that guardrail and is not recommended
+The compaction fuse recognizes the structured Codex ACP context-compaction
+update and Claude Agent ACP's compaction status update. One compaction is
+allowed. When the next compaction starts, Buzz invalidates every session on the
+adapter, replaces its process, dead-letters the batch immediately, and posts a
+failure notice. It deliberately does not retry the task: retrying the same
+runaway request would defeat the fuse.
+
+Setting any count limit to `0` disables that guardrail and is not recommended
 for unattended agents. The owner can use `!cancel` for the current turn or
 `!rotate` to force a fresh channel session.
 
@@ -96,7 +104,7 @@ count and adapter-process count are therefore not necessarily equal.
 Verify the startup log for each service. It should report values equivalent to:
 
 ```text
-max_turn=1800s max_turns_per_session=25 max_tool_calls_per_turn=100
+max_turn=1800s max_turns_per_session=25 max_tool_calls_per_turn=100 max_compactions_per_turn=1
 ```
 
 Building the binary alone does not update an already-running process.
@@ -109,7 +117,7 @@ After restart, every service was active, all 60 adapter children were present,
 and every startup summary reported:
 
 ```text
-idle_timeout=900s max_turn=1800s max_turns_per_session=25 max_tool_calls_per_turn=100
+idle_timeout=900s max_turn=1800s max_turns_per_session=25 max_tool_calls_per_turn=100 max_compactions_per_turn=1
 ```
 
 No startup errors were present in the post-restart service logs. The restart

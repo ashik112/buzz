@@ -1552,6 +1552,7 @@ async fn tokio_main() -> Result<()> {
         context_message_limit: config.context_message_limit,
         max_turns_per_session: config.max_turns_per_session,
         max_tool_calls_per_turn: config.max_tool_calls_per_turn,
+        max_compactions_per_turn: config.max_compactions_per_turn,
         permission_mode: config.permission_mode,
         agent_keys: config.keys.clone(),
         agent_owner_pubkey: startup_owner
@@ -3110,6 +3111,22 @@ fn handle_prompt_result(
                 // accounting, same as a clean cancel.
                 let reason = batch.cancel_reason.unwrap_or(CancelReason::Steer);
                 queue.requeue_as_cancelled(batch, reason);
+            } else if let PromptOutcome::Timeout(TimeoutKind::CompactionBudget {
+                compactions,
+                limit,
+            }) = &result.outcome
+            {
+                tracing::error!(
+                    channel_id = %batch.channel_id,
+                    events = batch.events.len(),
+                    compactions,
+                    limit,
+                    "dead-lettering batch after context-compaction fuse — no automatic retry"
+                );
+                let content = format!(
+                    "⚠️ I stopped the last request after it attempted more than {limit} context compaction(s). It was not retried to prevent runaway usage. Please split or re-send the task if it is still needed."
+                );
+                spawn_failure_notice(rest_client, &batch, content);
             } else if matches!(
                 result.outcome,
                 PromptOutcome::Timeout(TimeoutKind::Hard {
@@ -3207,6 +3224,7 @@ fn handle_prompt_result(
         PromptOutcome::Timeout(TimeoutKind::Idle) => "idle_timeout",
         PromptOutcome::Timeout(TimeoutKind::Hard { .. }) => "hard_timeout",
         PromptOutcome::Timeout(TimeoutKind::Budget { .. }) => "activity_budget",
+        PromptOutcome::Timeout(TimeoutKind::CompactionBudget { .. }) => "compaction_budget",
         PromptOutcome::AgentExited => "exited",
         PromptOutcome::Cancelled => "cancelled",
         PromptOutcome::CancelDrainTimeout(_) => "cancel_drain_timeout",
@@ -3283,6 +3301,10 @@ fn handle_prompt_result(
                 "activity_budget" => format!(
                     "Agent exceeded the per-turn tool-call limit ({}); the process is being replaced and the request follows the bounded retry policy.",
                     config.max_tool_calls_per_turn
+                ),
+                "compaction_budget" => format!(
+                    "Agent exceeded the per-turn context-compaction limit ({}); the process is being replaced and the request was not retried.",
+                    config.max_compactions_per_turn
                 ),
                 _ => "Agent session timed out due to inactivity".to_string(),
             };
@@ -5026,6 +5048,7 @@ mod build_mcp_servers_tests {
             context_message_limit: 12,
             max_turns_per_session: 0,
             max_tool_calls_per_turn: 100,
+            max_compactions_per_turn: 1,
             presence_enabled: true,
             typing_enabled: true,
             memory_enabled: false,
@@ -5248,6 +5271,7 @@ mod error_outcome_emission_tests {
             context_message_limit: 12,
             max_turns_per_session: 0,
             max_tool_calls_per_turn: 100,
+            max_compactions_per_turn: 1,
             presence_enabled: true,
             typing_enabled: true,
             memory_enabled: false,
@@ -5542,6 +5566,14 @@ mod error_outcome_emission_tests {
         )
         .await;
         check_label(
+            PromptOutcome::Timeout(TimeoutKind::CompactionBudget {
+                compactions: 2,
+                limit: 1,
+            }),
+            "compaction_budget",
+        )
+        .await;
+        check_label(
             PromptOutcome::CancelDrainTimeout(std::time::Duration::from_secs(5)),
             "cancel_drain_timeout",
         )
@@ -5638,6 +5670,25 @@ mod error_outcome_emission_tests {
         assert_eq!(
             hard_events, 0,
             "hard-cap timeout (not recently active) must drop all events"
+        );
+
+        // Compaction fuse: batch is dead-lettered immediately and never retried.
+        let compaction_batch = make_batch();
+        let (compaction_channels, compaction_events) = run(
+            PromptOutcome::Timeout(TimeoutKind::CompactionBudget {
+                compactions: 2,
+                limit: 1,
+            }),
+            compaction_batch,
+        )
+        .await;
+        assert_eq!(
+            compaction_channels, 0,
+            "compaction fuse must not requeue the batch"
+        );
+        assert_eq!(
+            compaction_events, 0,
+            "compaction fuse must drop all events from the failed batch"
         );
 
         // Idle timeout: batch IS requeued (first attempt, not yet dead-lettered).

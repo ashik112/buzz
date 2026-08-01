@@ -115,6 +115,7 @@ All configuration is via environment variables (or CLI flags — every env var h
 | `BUZZ_ACP_MAX_TURN_DURATION` | no | `1800` | Absolute wall-clock cap per turn (safety valve). |
 | `BUZZ_ACP_MAX_TURNS_PER_SESSION` | no | `25` | Rotate the ACP session after this many successful turns. `0` disables proactive rotation. |
 | `BUZZ_ACP_MAX_TOOL_CALLS_PER_TURN` | no | `100` | Stop a turn after this many ACP `tool_call` updates. `0` disables the circuit breaker. |
+| `BUZZ_ACP_MAX_COMPACTIONS_PER_TURN` | no | `1` | Stop a turn when it attempts more context compactions than this. `0` disables the fuse. |
 | `BUZZ_API_TOKEN` | no | — | API token (required if relay enforces token auth). |
 
 **Note:** `BUZZ_ACP_AGENT_ARGS` splits on commas. For args with values, use: `-c,key="value"`.
@@ -132,10 +133,13 @@ The defaults bound both passive context growth and active tool loops:
 - A turn is stopped after 100 ACP `tool_call` updates. The affected adapter is
   discarded and replaced so a potentially poisoned session is not reused. The
   batch enters the existing bounded retry queue with exponential backoff.
+- One context compaction is allowed per turn. A second compaction stops the
+  turn and replaces the adapter. That task is not retried automatically, which
+  prevents repeated compact-and-continue loops from consuming unbounded tokens.
 
-Set either count limit to `0` only when intentionally accepting unbounded
-sessions or tool activity. Operators can also send `!rotate` to start a fresh
-session for a channel immediately.
+Set any count limit to `0` only when intentionally accepting the corresponding
+unbounded behavior. Operators can also send `!rotate` to start a fresh session
+for a channel immediately.
 
 See [Fork maintenance and ACP safety](../../docs/fork-maintenance.md) for the
 update and rollout procedure used by the guarded fork.
