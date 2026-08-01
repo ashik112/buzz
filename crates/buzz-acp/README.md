@@ -111,13 +111,34 @@ All configuration is via environment variables (or CLI flags — every env var h
 | `BUZZ_ACP_AGENT_COMMAND` | no | `goose` | Agent binary to spawn. |
 | `BUZZ_ACP_AGENT_ARGS` | no | `acp` | Agent arguments (comma-separated). |
 | `BUZZ_ACP_MCP_COMMAND` | no | `""` (empty) | Path to an optional MCP server binary to provide to the agent subprocess. |
-| `BUZZ_ACP_IDLE_TIMEOUT` | no | `620` | Idle timeout: max seconds of silence before cancelling a turn. Resets on any agent stdout activity. |
-| `BUZZ_ACP_MAX_TURN_DURATION` | no | `7200` | Absolute wall-clock cap per turn (safety valve). |
+| `BUZZ_ACP_IDLE_TIMEOUT` | no | `900` | Idle timeout: max seconds of silence before cancelling a turn. Resets on any agent stdout activity. |
+| `BUZZ_ACP_MAX_TURN_DURATION` | no | `1800` | Absolute wall-clock cap per turn (safety valve). |
+| `BUZZ_ACP_MAX_TURNS_PER_SESSION` | no | `25` | Rotate the ACP session after this many successful turns. `0` disables proactive rotation. |
+| `BUZZ_ACP_MAX_TOOL_CALLS_PER_TURN` | no | `100` | Stop a turn after this many ACP `tool_call` updates. `0` disables the circuit breaker. |
 | `BUZZ_API_TOKEN` | no | — | API token (required if relay enforces token auth). |
 
 **Note:** `BUZZ_ACP_AGENT_ARGS` splits on commas. For args with values, use: `-c,key="value"`.
 
 **Legacy env vars:** `BUZZ_ACP_PRIVATE_KEY`, `BUZZ_ACP_API_TOKEN`, and `BUZZ_ACP_TURN_TIMEOUT` (replaced by `BUZZ_ACP_IDLE_TIMEOUT`) are still accepted as fallbacks.
+
+### Context and spend guardrails
+
+The defaults bound both passive context growth and active tool loops:
+
+- A turn is cancelled after 30 minutes even when regular output keeps resetting
+  the idle timeout.
+- A channel receives a fresh ACP session after 25 successful turns, preventing an
+  indefinitely growing transcript from being replayed on every prompt.
+- A turn is stopped after 100 ACP `tool_call` updates. The affected adapter is
+  discarded and replaced so a potentially poisoned session is not reused. The
+  batch enters the existing bounded retry queue with exponential backoff.
+
+Set either count limit to `0` only when intentionally accepting unbounded
+sessions or tool activity. Operators can also send `!rotate` to start a fresh
+session for a channel immediately.
+
+See [Fork maintenance and ACP safety](../../docs/fork-maintenance.md) for the
+update and rollout procedure used by the guarded fork.
 
 ### Parallel Agents & Heartbeat
 
