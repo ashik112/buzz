@@ -39,6 +39,36 @@ Develop additional changes on a short-lived branch, review and test them, and
 then merge them into `main`. The merged `safety/context-guardrails` branch may
 remain as a historical reference; running code should be built from `main`.
 
+### Upstream synchronization record: 2026-08-02
+
+Upstream `f86cfc736` was merged into the guarded fork as merge commit
+`cfcc48cd7`. The merge brought the fork current with Block's `main` without
+rewriting fork history. The ACP refactor merged without textual conflicts, and
+all four fork-specific guardrail configuration and enforcement paths remained
+present in the merged source.
+
+This synchronization changes source only. It does not by itself rebuild
+`buzz-acp`, restart the systemd fleet, or move the digest-pinned relay
+container image. Treat build, rollout, and image upgrades as separate,
+verified operations.
+
+The merge also added the open-source remote-agent provider protocol and its
+first implementation:
+
+- `docs/remote-agents.md` formally specifies discovery, trust boundaries,
+  lifecycle, presence-based status, shutdown, and conformance.
+- `buzz-backend-kubernetes` lets Buzz Desktop deploy a managed agent as a
+  Kubernetes Pod while retaining the managed-agent record in Desktop.
+- The provider uses ambient kubeconfig, a per-attempt Kubernetes Secret, and
+  an immutable digest-qualified Sprig image.
+- `BUZZ_ACP_EXIT_AFTER_INACTIVITY` adds an optional, pool-independent
+  self-stop bound for remote workloads.
+
+This is a new deployment path, not an adoption path for the existing systemd
+fleet. The current Kubernetes v1 path has no undeploy operation and no baked
+public default Sprig image; operators must provide an image digest and manage
+any residual Kubernetes objects. See `docs/remote-agents.md`.
+
 ## ACP context and spend guardrails
 
 The guarded fork's `main` branch uses these `buzz-acp` defaults:
